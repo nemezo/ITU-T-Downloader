@@ -1,18 +1,6 @@
 # ITU Downloader
 
-Archive ITU-T test signals and publications with a deterministic folder layout.
-
-The script uses Playwright for JavaScript-rendered ITU pages, stores every downloaded artifact in a stable hierarchy, and appends a JSONL manifest with SHA-256 checksums for auditability.
-
-## Features
-
-- Discover and download ITU-T test signal vector packages
-- Discover codec-focused ITU-T Recommendation pages by profile or allow-list
-- Download PDFs, archives, source-code attachments, and test-vector payloads
-- Deterministic output path: `collection/series/recommendation/edition/type/`
-- Resumable downloads with byte-range requests
-- JSONL manifest with SHA-256 checksums per artifact
-- Graceful shutdown on SIGINT/SIGTERM
+Archive ITU-T test signals and publications from the [ITU website](https://www.itu.int/rec/T-REC-P/en) for research and offline access.
 
 ## Requirements
 
@@ -66,19 +54,6 @@ just test
 
 # Or run all checks at once
 just ci
-```
-
-## Output layout
-
-```text
-research/itu-archive/
-├── index/
-│   ├── discovered-pages.json
-│   ├── accepted-pages.json
-│   └── rejected-pages.json
-├── manifest.jsonl
-└── <collection>/<series>/<recommendation>/<edition>/<type>/
-    └── <artifact>
 ```
 
 ## License

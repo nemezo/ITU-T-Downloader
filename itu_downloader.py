@@ -27,19 +27,33 @@ Example:
 from __future__ import annotations
 
 import argparse
+import bz2
 import concurrent.futures
+import gzip
 import hashlib
 import json
+import lzma
 import re
+import shutil
+import stat
 import signal
+import tarfile
 import threading
 import time
-from collections.abc import Iterable
-from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+import zipfile
+from dataclasses import asdict
+from dataclasses import dataclass
+from dataclasses import replace
+from datetime import datetime
+from datetime import timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote, urljoin, urlparse
+from typing import Iterable
+from urllib.parse import parse_qs
+from urllib.parse import unquote
+from urllib.parse import urljoin
+from urllib.parse import urlparse
+
 
 TEST_SIGNALS_URL = "https://www.itu.int/myworkspace/t-signals"
 RECOMMENDATION_INDEX_URL = "https://www.itu.int/itu-t/recommendations/index.aspx?ser={series}"
@@ -156,6 +170,10 @@ class DownloadInterrupted(RuntimeError):
     """Raised when shutdown was requested while a download was in progress."""
 
 
+class ArchiveExtractionError(RuntimeError):
+    """Raised when an archive cannot be extracted safely."""
+
+
 class PlainProgress:
     """No-op progress adapter used when Rich is unavailable."""
 
@@ -180,22 +198,20 @@ class ProgressReporter:
 
     def __init__(self, verbose: bool) -> None:
         self.verbose = verbose
-        self.console: Any = None
-        self.progress_class: Any = None
-        self.progress_columns: tuple[Any, ...] = ()
-        self.table_class: Any = None
+        self.console = None
+        self.progress_class = None
+        self.progress_columns = ()
+        self.table_class = None
 
         try:
             from rich.console import Console
-            from rich.progress import (
-                BarColumn,
-                MofNCompleteColumn,
-                Progress,
-                SpinnerColumn,
-                TextColumn,
-                TimeElapsedColumn,
-                TimeRemainingColumn,
-            )
+            from rich.progress import BarColumn
+            from rich.progress import MofNCompleteColumn
+            from rich.progress import Progress
+            from rich.progress import SpinnerColumn
+            from rich.progress import TextColumn
+            from rich.progress import TimeElapsedColumn
+            from rich.progress import TimeRemainingColumn
             from rich.table import Table
         except ModuleNotFoundError:
             return
@@ -260,10 +276,10 @@ def shutdown_requested(shutdown_event: threading.Event | None) -> bool:
     return shutdown_event is not None and shutdown_event.is_set()
 
 
-def install_shutdown_handlers(shutdown_event: threading.Event) -> dict[int, Any]:
+def install_shutdown_handlers(shutdown_event: threading.Event) -> dict[int, object]:
     """Trap Ctrl+C/SIGTERM and ask workers to stop after current chunks."""
 
-    previous_handlers: dict[int, Any] = {}
+    previous_handlers: dict[int, object] = {}
 
     def handle_shutdown(signum, frame) -> None:
         shutdown_event.set()
@@ -275,7 +291,7 @@ def install_shutdown_handlers(shutdown_event: threading.Event) -> dict[int, Any]
     return previous_handlers
 
 
-def restore_shutdown_handlers(previous_handlers: dict[int, Any]) -> None:
+def restore_shutdown_handlers(previous_handlers: dict[int, object]) -> None:
     """Restore signal handlers changed by install_shutdown_handlers."""
 
     for signum, handler in previous_handlers.items():
@@ -333,7 +349,6 @@ def require_playwright():
 
     return sync_playwright, PlaywrightTimeoutError
 
-
 ALLOWED_DOMAINS = {
     "www.itu.int",
     "itu.int",
@@ -359,6 +374,25 @@ ARCHIVE_EXTENSIONS = {
     ".xz",
     ".rar",
 }
+
+SUPPORTED_ARCHIVE_SUFFIXES = (
+    ".tar.gz",
+    ".tar.bz2",
+    ".tar.xz",
+    ".tbz2",
+    ".txz",
+    ".tgz",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+)
+
+UNSUPPORTED_ARCHIVE_SUFFIXES = (
+    ".7z",
+    ".rar",
+)
 
 AUDIO_EXTENSIONS = {
     ".wav",
@@ -483,6 +517,12 @@ class DownloadRecord:
     sha256: str
     status: str
     downloaded_at_utc: str
+    extracted_path: str = ""
+    extracted_files: int = 0
+    etag: str = ""
+    last_modified: str = ""
+    content_length: str = ""
+    archive_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -602,7 +642,8 @@ def series_values_for_publications(
         return list(BROAD_SERIES)
 
     series_values = {
-        recommendation_series(recommendation) for recommendation in allowed_recommendations
+        recommendation_series(recommendation)
+        for recommendation in allowed_recommendations
     }
     series_values.discard("UNKNOWN")
     return sorted(series_values)
@@ -867,13 +908,13 @@ def infer_artifact_type(url: str, link_text: str, content_type: str = "") -> str
     suffix = Path(unquote(urlparse(url).path)).suffix.lower()
     text = f"{url} {link_text} {content_type}".lower()
 
-    if "!!pdf" in text:
+    if "!!pdf" in text or "-pdf-" in text:
         return "recommendation"
 
-    if "!!msw" in text or "!!zwd" in text:
+    if "!!msw" in text or "-msw-" in text or "!!zwd" in text or "-zwd-" in text:
         return "documents"
 
-    if "!!soft" in text:
+    if "!!soft" in text or "-soft-" in text or "-zst-" in text:
         return "reference-software"
 
     if "source" in text or suffix in SOURCE_EXTENSIONS:
@@ -912,7 +953,7 @@ def infer_artifact_type(url: str, link_text: str, content_type: str = "") -> str
     return "other"
 
 
-def api_json(client: Any, url: str, params: dict[str, object] | None = None) -> Any:
+def api_json(client: object, url: str, params: dict[str, object] | None = None) -> Any:
     """Fetch JSON from the ITU MyWorkspace API."""
 
     response = client.get(url, params=params)
@@ -920,7 +961,7 @@ def api_json(client: Any, url: str, params: dict[str, object] | None = None) -> 
     return response.json()
 
 
-def api_text(client: Any, url: str) -> str:
+def api_text(client: object, url: str) -> str:
     """Fetch a static ITU HTML page with the shared HTTP client."""
 
     response = client.get(url)
@@ -1158,7 +1199,8 @@ def discover_publication_pages(
 
     if latest_only:
         return [
-            replace(page, edition_group="latest") for page in latest_pages_by_recommendation(pages)
+            replace(page, edition_group="latest")
+            for page in latest_pages_by_recommendation(pages)
         ]
 
     return dedupe_pages(pages)
@@ -1212,11 +1254,17 @@ def test_signal_downloads(
         if known_editions:
             latest_edition = max(known_editions)
             records = [
-                record for record in records if edition_sort_key(record[2]) == latest_edition
+                record
+                for record in records
+                if edition_sort_key(record[2]) == latest_edition
             ]
 
     downloads = [(url, link_text) for url, link_text, _ in records]
-    editions = {edition for _, _, edition in records if edition != "unknown-edition"}
+    editions = {
+        edition
+        for _, _, edition in records
+        if edition != "unknown-edition"
+    }
 
     if len(editions) == 1:
         edition = next(iter(editions))
@@ -1335,7 +1383,13 @@ def target_directory(root: Path, page: PageRecord, artifact_type: str) -> Path:
     recommendation = page.recommendation or "UNKNOWN"
 
     if page.collection == "test-signals":
-        return root / "test-signals" / "by-recommendation" / recommendation / artifact_type
+        return (
+            root
+            / "test-signals"
+            / "by-recommendation"
+            / recommendation
+            / artifact_type
+        )
 
     return (
         root
@@ -1355,50 +1409,137 @@ def filename_from_itu_item_id(url: str) -> str:
     if not item_id:
         return ""
 
-    lower_id = item_id.lower()
-    suffix = ""
+    suffix = extension_hint_from_itu_tokens(item_id)
 
-    if "!!pdf" in lower_id:
-        suffix = ".pdf"
-    elif "!!msw" in lower_id:
-        suffix = ".doc"
-    elif "!!zwd" in lower_id or "!!soft" in lower_id:
-        suffix = ".zip"
-
-    if suffix and not lower_id.endswith(suffix):
+    if suffix and not item_id.lower().endswith(suffix):
         item_id = f"{item_id}{suffix}"
 
     return slugify(item_id, "download.bin")
 
 
-def filename_from_response(url: str, response: Any) -> str:
+def extension_hint_from_itu_tokens(value: str) -> str:
+    """Infer file extensions from ITU item-id tokens."""
+
+    text = value.lower()
+
+    if "!!pdf" in text or "-pdf-" in text:
+        return ".pdf"
+
+    if "!!msw" in text or "-msw-" in text:
+        return ".doc"
+
+    if "!!zwd" in text or "-zwd-" in text or "!!soft" in text or "-soft-" in text or "-zst-" in text:
+        return ".zip"
+
+    return ""
+
+
+def response_content_type(response: object) -> str:
+    """Return the normalized response content type without parameters."""
+
+    return response.headers.get("content-type", "").split(";", maxsplit=1)[0].lower()
+
+
+def extension_hint_from_content_type(content_type: str) -> str:
+    """Infer file extensions from common downloadable content types."""
+
+    content_type = content_type.lower()
+    content_type_extensions = {
+        "application/pdf": ".pdf",
+        "application/zip": ".zip",
+        "application/x-zip-compressed": ".zip",
+        "application/x-7z-compressed": ".7z",
+        "application/vnd.rar": ".rar",
+        "application/x-rar-compressed": ".rar",
+        "application/x-tar": ".tar",
+        "application/gzip": ".gz",
+        "application/x-gzip": ".gz",
+        "application/x-bzip2": ".bz2",
+        "application/x-xz": ".xz",
+        "application/msword": ".doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+        "application/vnd.ms-excel": ".xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    }
+    return content_type_extensions.get(content_type, "")
+
+
+def has_known_download_extension(filename: str) -> bool:
+    """Return whether a filename already ends with a known payload suffix."""
+
+    lower_name = filename.lower()
+    suffixes = (
+        SUPPORTED_ARCHIVE_SUFFIXES
+        + UNSUPPORTED_ARCHIVE_SUFFIXES
+        + tuple(PUBLICATION_EXTENSIONS | AUDIO_EXTENSIONS | DATA_EXTENSIONS | SOURCE_EXTENSIONS)
+    )
+    return any(lower_name.endswith(suffix) for suffix in suffixes)
+
+
+def response_is_pdf(url: str, response: object) -> bool:
+    """Return whether URL or headers identify a PDF payload."""
+
+    text = f"{url} {response.url} {response.headers.get('content-disposition', '')}".lower()
+
+    return (
+        response_content_type(response) == "application/pdf"
+        or "!!pdf" in text
+        or Path(unquote(urlparse(str(response.url)).path)).suffix.lower() == ".pdf"
+    )
+
+
+def ensure_response_extension(filename: str, url: str, response: object) -> str:
+    """Append critical extensions inferred from response metadata."""
+
+    disposition = response.headers.get("content-disposition", "")
+    extension = (
+        extension_hint_from_itu_tokens(f"{filename} {url} {response.url} {disposition}")
+        or extension_hint_from_content_type(response_content_type(response))
+    )
+
+    if response_is_pdf(url, response):
+        extension = ".pdf"
+
+    if not extension:
+        return filename
+
+    if extension == ".pdf" and not filename.lower().endswith(".pdf"):
+        return f"{filename}{extension}"
+
+    if not has_known_download_extension(filename):
+        return f"{filename}{extension}"
+
+    return filename
+
+
+def filename_from_response(url: str, response: object) -> str:
     """Derive a stable filename from Content-Disposition or URL."""
 
     item_id_name = filename_from_itu_item_id(url)
 
     if item_id_name:
-        return item_id_name
+        return ensure_response_extension(item_id_name, url, response)
 
     disposition = response.headers.get("content-disposition", "")
     match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', disposition, re.IGNORECASE)
 
     if match:
-        return slugify(unquote(match.group(1)), "download.bin")
+        return ensure_response_extension(slugify(unquote(match.group(1)), "download.bin"), url, response)
 
     parsed_path = unquote(urlparse(str(response.url)).path)
     name = Path(parsed_path).name
 
     if name:
-        return slugify(name, "download.bin")
+        return ensure_response_extension(slugify(name, "download.bin"), url, response)
 
     digest = hashlib.sha256(str(response.url).encode("utf-8")).hexdigest()[:16]
-    return f"download-{digest}.bin"
+    return ensure_response_extension(f"download-{digest}.bin", url, response)
 
 
-def should_accept_response(response: Any) -> bool:
+def should_accept_response(response: object) -> bool:
     """Reject HTML pages that are not actual downloadable artifacts."""
 
-    content_type = response.headers.get("content-type", "").split(";", maxsplit=1)[0].lower()
+    content_type = response_content_type(response)
     suffix = Path(unquote(urlparse(str(response.url)).path)).suffix.lower()
 
     if content_type in BINARY_CONTENT_TYPES:
@@ -1419,10 +1560,7 @@ def unique_path(path: Path) -> Path:
     for index in range(1, 10000):
         candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
 
-        if (
-            not candidate.exists()
-            and not candidate.with_suffix(candidate.suffix + ".part").exists()
-        ):
+        if not candidate.exists() and not candidate.with_suffix(candidate.suffix + ".part").exists():
             return candidate
 
     raise RuntimeError(f"Could not allocate unique file path for {path}")
@@ -1455,10 +1593,195 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def archive_suffix(path: Path) -> str:
+    """Return the recognized archive suffix, including compound suffixes."""
+
+    name = path.name.lower()
+
+    for suffix in SUPPORTED_ARCHIVE_SUFFIXES + UNSUPPORTED_ARCHIVE_SUFFIXES:
+        if name.endswith(suffix):
+            return suffix
+
+    return ""
+
+
+def archive_stem(path: Path) -> str:
+    """Return a stable extraction directory name for an archive path."""
+
+    suffix = archive_suffix(path)
+
+    if suffix:
+        return slugify(path.name[: -len(suffix)], path.stem)
+
+    return slugify(path.stem, "archive")
+
+
+def is_supported_archive(path: Path) -> bool:
+    """Return whether stdlib can extract this archive."""
+
+    return archive_suffix(path) in SUPPORTED_ARCHIVE_SUFFIXES
+
+
+def is_unsupported_archive(path: Path) -> bool:
+    """Return whether the file is a known archive without stdlib support."""
+
+    return archive_suffix(path) in UNSUPPORTED_ARCHIVE_SUFFIXES
+
+
+def safe_member_path(root: Path, member_name: str) -> Path:
+    """Return a member extraction path or reject unsafe traversal."""
+
+    if not member_name or Path(member_name).is_absolute():
+        raise ArchiveExtractionError(f"unsafe archive member path: {member_name!r}")
+
+    candidate = (root / member_name).resolve()
+    resolved_root = root.resolve()
+
+    if candidate != resolved_root and resolved_root not in candidate.parents:
+        raise ArchiveExtractionError(f"unsafe archive member path: {member_name!r}")
+
+    return candidate
+
+
+def extract_zip_archive(archive_path: Path, extract_dir: Path) -> int:
+    """Extract a zip archive after validating member paths and symlinks."""
+
+    extracted_files = 0
+
+    with zipfile.ZipFile(archive_path) as archive:
+        for member in archive.infolist():
+            safe_member_path(extract_dir, member.filename)
+            mode = member.external_attr >> 16
+
+            if stat.S_ISLNK(mode):
+                raise ArchiveExtractionError(f"unsafe zip symlink: {member.filename}")
+
+        for member in archive.infolist():
+            archive.extract(member, extract_dir)
+
+            if not member.is_dir():
+                extracted_files += 1
+
+    return extracted_files
+
+
+def extract_tar_archive(archive_path: Path, extract_dir: Path) -> int:
+    """Extract a tar archive after validating member paths and link types."""
+
+    extracted_files = 0
+
+    with tarfile.open(archive_path) as archive:
+        members = archive.getmembers()
+
+        for member in members:
+            safe_member_path(extract_dir, member.name)
+
+            if member.issym() or member.islnk():
+                raise ArchiveExtractionError(f"unsafe tar link: {member.name}")
+
+            if not member.isfile() and not member.isdir():
+                raise ArchiveExtractionError(f"unsupported tar member type: {member.name}")
+
+        try:
+            archive.extractall(extract_dir, members=members, filter="data")
+        except TypeError:
+            archive.extractall(extract_dir, members=members)
+
+        extracted_files = sum(1 for member in members if member.isfile())
+
+    return extracted_files
+
+
+def extract_single_file_archive(archive_path: Path, extract_dir: Path, opener: object) -> int:
+    """Extract a single-file compression format."""
+
+    output_name = archive_stem(archive_path)
+    output_path = safe_member_path(extract_dir, output_name)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with opener(archive_path, "rb") as source, output_path.open("wb") as target:
+        shutil.copyfileobj(source, target)
+
+    return 1
+
+
+def extract_archive_payload(archive_path: Path, extract_dir: Path) -> int:
+    """Extract one supported archive into extract_dir."""
+
+    suffix = archive_suffix(archive_path)
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    if suffix == ".zip":
+        return extract_zip_archive(archive_path, extract_dir)
+
+    if suffix in {".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz"}:
+        return extract_tar_archive(archive_path, extract_dir)
+
+    if suffix == ".gz":
+        return extract_single_file_archive(archive_path, extract_dir, gzip.open)
+
+    if suffix == ".bz2":
+        return extract_single_file_archive(archive_path, extract_dir, bz2.open)
+
+    if suffix == ".xz":
+        return extract_single_file_archive(archive_path, extract_dir, lzma.open)
+
+    raise ArchiveExtractionError(f"unsupported archive format: {archive_path.name}")
+
+
+def write_extraction_marker(
+    extract_dir: Path,
+    source_url: str,
+    final_url: str,
+    response: object,
+    archive_sha256: str,
+    extracted_files: int,
+) -> Path:
+    """Write the marker used to skip already extracted archives."""
+
+    marker = extract_dir / ".itu-extract.json"
+    write_json(
+        marker,
+        {
+            "source_url": source_url,
+            "final_url": final_url,
+            "etag": response.headers.get("etag", ""),
+            "last_modified": response.headers.get("last-modified", ""),
+            "content_length": response.headers.get("content-length", ""),
+            "archive_sha256": archive_sha256,
+            "extracted_files": extracted_files,
+            "extracted_at_utc": utc_now(),
+        },
+    )
+    return marker
+
+
+def extracted_download_available(record: dict[str, object]) -> bool:
+    """Return whether an extracted archive record still has its marker."""
+
+    if record.get("status") != "downloaded-extracted":
+        return False
+
+    output_path = record.get("output_path")
+
+    if not output_path:
+        return False
+
+    path = Path(str(output_path))
+    return path.is_dir() and (path / ".itu-extract.json").is_file()
+
+
 def completed_download_available(record: dict[str, object]) -> bool:
     """Return whether a downloaded manifest record still points at a real file."""
 
-    if record.get("status") != "downloaded":
+    if extracted_download_available(record):
+        return True
+
+    if record.get("status") not in {
+        "downloaded",
+        "downloaded-unsupported-archive",
+        "archive-extract-failed",
+    }:
         return False
 
     output_path = record.get("output_path")
@@ -1477,7 +1800,7 @@ def completed_download_available(record: dict[str, object]) -> bool:
         return True
 
     try:
-        size_bytes = int(str(expected_size))
+        size_bytes = int(expected_size)
     except (TypeError, ValueError):
         return True
 
@@ -1541,11 +1864,122 @@ def append_jsonl(path: Path, payload: object) -> None:
 def utc_now() -> str:
     """Return an ISO-8601 UTC timestamp."""
 
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def response_record_metadata(response: object) -> dict[str, str]:
+    """Return stable response metadata for manifest records."""
+
+    return {
+        "etag": response.headers.get("etag", ""),
+        "last_modified": response.headers.get("last-modified", ""),
+        "content_length": response.headers.get("content-length", ""),
+    }
+
+
+def archive_postprocess_record(
+    page: PageRecord,
+    source_url: str,
+    link_text: str,
+    response: object,
+    output_path: Path,
+    content_type: str,
+    size_bytes: int,
+    extract_archives: bool,
+) -> DownloadRecord | None:
+    """Extract supported archives or mark unsupported archives."""
+
+    if not extract_archives:
+        return None
+
+    if not is_supported_archive(output_path) and not is_unsupported_archive(output_path):
+        return None
+
+    artifact_type = infer_artifact_type(str(response.url), link_text, content_type)
+    archive_sha256 = sha256_file(output_path)
+    metadata = response_record_metadata(response)
+
+    if is_unsupported_archive(output_path):
+        return DownloadRecord(
+            collection=page.collection,
+            page_url=page.url,
+            page_title=page.title,
+            series=page.series,
+            recommendation=page.recommendation,
+            edition=page.edition,
+            artifact_type=artifact_type,
+            source_url=source_url,
+            final_url=str(response.url),
+            output_path=str(output_path),
+            content_type=content_type,
+            size_bytes=size_bytes,
+            sha256=archive_sha256,
+            status="downloaded-unsupported-archive",
+            downloaded_at_utc=utc_now(),
+            archive_sha256=archive_sha256,
+            **metadata,
+        )
+
+    extract_dir = output_path.with_name(archive_stem(output_path))
+
+    try:
+        extracted_files = extract_archive_payload(output_path, extract_dir)
+        write_extraction_marker(
+            extract_dir,
+            source_url,
+            str(response.url),
+            response,
+            archive_sha256,
+            extracted_files,
+        )
+    except Exception:
+        return DownloadRecord(
+            collection=page.collection,
+            page_url=page.url,
+            page_title=page.title,
+            series=page.series,
+            recommendation=page.recommendation,
+            edition=page.edition,
+            artifact_type=artifact_type,
+            source_url=source_url,
+            final_url=str(response.url),
+            output_path=str(output_path),
+            content_type=content_type,
+            size_bytes=size_bytes,
+            sha256=archive_sha256,
+            status="archive-extract-failed",
+            downloaded_at_utc=utc_now(),
+            archive_sha256=archive_sha256,
+            **metadata,
+        )
+
+    output_path.unlink()
+
+    return DownloadRecord(
+        collection=page.collection,
+        page_url=page.url,
+        page_title=page.title,
+        series=page.series,
+        recommendation=page.recommendation,
+        edition=page.edition,
+        artifact_type=artifact_type,
+        source_url=source_url,
+        final_url=str(response.url),
+        output_path=str(extract_dir),
+        content_type=content_type,
+        size_bytes=size_bytes,
+        sha256=archive_sha256,
+        status="downloaded-extracted",
+        downloaded_at_utc=utc_now(),
+        extracted_path=str(extract_dir),
+        extracted_files=extracted_files,
+        archive_sha256=archive_sha256,
+        **metadata,
+    )
 
 
 def download_artifact(
-    client: Any,
+    client: object,
     root: Path,
     page: PageRecord,
     source_url: str,
@@ -1553,6 +1987,7 @@ def download_artifact(
     delay: float,
     dry_run: bool,
     shutdown_event: threading.Event | None = None,
+    extract_archives: bool = True,
 ) -> DownloadRecord:
     """Download one artifact and return a manifest record."""
 
@@ -1599,9 +2034,7 @@ def download_artifact(
 
         if provisional_name:
             provisional_output = provisional_dir / provisional_name
-            provisional_temporary = provisional_output.with_suffix(
-                provisional_output.suffix + ".part"
-            )
+            provisional_temporary = provisional_output.with_suffix(provisional_output.suffix + ".part")
 
             if provisional_temporary.exists():
                 resume_bytes = provisional_temporary.stat().st_size
@@ -1650,6 +2083,20 @@ def download_artifact(
         output_path, temporary_path, already_exists = resumable_paths(output_dir / filename)
 
         if already_exists:
+            archive_record = archive_postprocess_record(
+                page,
+                source_url,
+                link_text,
+                response,
+                output_path,
+                content_type,
+                output_path.stat().st_size,
+                extract_archives,
+            )
+
+            if archive_record is not None:
+                return archive_record
+
             return DownloadRecord(
                 collection=page.collection,
                 page_url=page.url,
@@ -1666,6 +2113,7 @@ def download_artifact(
                 sha256=sha256_file(output_path),
                 status="skipped-existing-file",
                 downloaded_at_utc=utc_now(),
+                **response_record_metadata(response),
             )
 
         resumed = temporary_path.exists() and temporary_path.stat().st_size > 0
@@ -1688,6 +2136,20 @@ def download_artifact(
 
         temporary_path.replace(output_path)
 
+    archive_record = archive_postprocess_record(
+        page,
+        source_url,
+        link_text,
+        response,
+        output_path,
+        content_type,
+        size_bytes,
+        extract_archives,
+    )
+
+    if archive_record is not None:
+        return archive_record
+
     return DownloadRecord(
         collection=page.collection,
         page_url=page.url,
@@ -1704,6 +2166,7 @@ def download_artifact(
         sha256=sha256_file(output_path),
         status="downloaded",
         downloaded_at_utc=utc_now(),
+        **response_record_metadata(response),
     )
 
 
@@ -1721,10 +2184,13 @@ def crawl(args: argparse.Namespace) -> None:
         "assets": 0,
         "duplicates": 0,
         "downloaded": 0,
+        "downloaded_extracted": 0,
+        "downloaded_unsupported_archive": 0,
         "dry_run": 0,
         "skipped_existing": 0,
         "skipped_existing_file": 0,
         "skipped_non_download": 0,
+        "archive_extract_failed": 0,
         "interrupted": 0,
         "errors": 0,
     }
@@ -1755,9 +2221,7 @@ def crawl(args: argparse.Namespace) -> None:
                     discovered_pages.extend(discover_test_signal_pages(client))
 
                     if args.test_signal_val_range:
-                        discovered_pages.extend(
-                            build_test_signal_range_pages(args.test_signal_val_range)
-                        )
+                        discovered_pages.extend(build_test_signal_range_pages(args.test_signal_val_range))
 
                 if args.include_publications:
                     series_values = series_values_for_publications(args, recommendation_allow_list)
@@ -1796,9 +2260,7 @@ def crawl(args: argparse.Namespace) -> None:
 
                 completed_downloads = load_completed_downloads(manifest_path)
                 discovered_assets: list[AssetRecord] = []
-                page_task = progress.add_task(
-                    "Scanning pages for assets", total=len(accepted_pages)
-                )
+                page_task = progress.add_task("Scanning pages for assets", total=len(accepted_pages))
 
                 for raw_page in accepted_pages:
                     if shutdown_event.is_set():
@@ -1809,9 +2271,7 @@ def crawl(args: argparse.Namespace) -> None:
                         description=f"Scanning {raw_page.collection} {raw_page.recommendation}",
                     )
                     try:
-                        page, downloads = enrich_page(
-                            raw_page, args.timeout_ms, client, latest_only
-                        )
+                        page, downloads = enrich_page(raw_page, args.timeout_ms, client, latest_only)
                     except Exception as error:
                         stats["errors"] += 1
                         append_jsonl(
@@ -1840,9 +2300,7 @@ def crawl(args: argparse.Namespace) -> None:
                 stats["assets"] = len(unique_assets)
                 stats["duplicates"] = len(discovered_assets) - len(unique_assets)
                 discovered_downloads = [asset_manifest_record(asset) for asset in unique_assets]
-                write_json(
-                    output_root / "index" / "discovered-downloads.json", discovered_downloads
-                )
+                write_json(output_root / "index" / "discovered-downloads.json", discovered_downloads)
 
                 download_task = progress.add_task(
                     f"Downloading assets ({jobs} workers)",
@@ -1855,9 +2313,7 @@ def crawl(args: argparse.Namespace) -> None:
                         stats["skipped_existing"] += 1
 
                         if args.verbose:
-                            reporter.log(
-                                f"[skip] already downloaded {asset.source_url}", style="yellow"
-                            )
+                            reporter.log(f"[skip] already downloaded {asset.source_url}", style="yellow")
 
                         progress.advance(download_task)
                     else:
@@ -1886,6 +2342,7 @@ def crawl(args: argparse.Namespace) -> None:
                         args.delay,
                         args.dry_run,
                         shutdown_event,
+                        not args.no_extract_archives,
                     )
                     active[future] = asset
 
@@ -1915,9 +2372,7 @@ def crawl(args: argparse.Namespace) -> None:
 
                         for future in done:
                             asset = active.pop(future)
-                            progress.update(
-                                download_task, description=f"Handled {asset.page.recommendation}"
-                            )
+                            progress.update(download_task, description=f"Handled {asset.page.recommendation}")
 
                             try:
                                 record = future.result()
@@ -1943,17 +2398,21 @@ def crawl(args: argparse.Namespace) -> None:
 
                                 if record.status == "downloaded":
                                     stats["downloaded"] += 1
+                                elif record.status == "downloaded-extracted":
+                                    stats["downloaded_extracted"] += 1
+                                elif record.status == "downloaded-unsupported-archive":
+                                    stats["downloaded_unsupported_archive"] += 1
                                 elif record.status == "dry-run":
                                     stats["dry_run"] += 1
                                 elif record.status == "skipped-existing-file":
                                     stats["skipped_existing_file"] += 1
                                 elif record.status == "skipped-non-download":
                                     stats["skipped_non_download"] += 1
+                                elif record.status == "archive-extract-failed":
+                                    stats["archive_extract_failed"] += 1
 
                                 if args.verbose:
-                                    reporter.log(
-                                        f"[{record.status}] {record.output_path}", style="green"
-                                    )
+                                    reporter.log(f"[{record.status}] {record.output_path}", style="green")
 
                             progress.advance(download_task)
 
@@ -1961,10 +2420,7 @@ def crawl(args: argparse.Namespace) -> None:
                             exhausted = True
 
                 if shutdown_event.is_set():
-                    reporter.log(
-                        "Graceful shutdown complete. Partial .part files are resumable.",
-                        style="yellow",
-                    )
+                    reporter.log("Graceful shutdown complete. Partial .part files are resumable.", style="yellow")
 
     finally:
         restore_shutdown_handlers(previous_handlers)
@@ -2007,7 +2463,11 @@ def parse_args() -> argparse.Namespace:
         description="Download ITU-T test signals and publications into a structured archive."
     )
 
-    parser.add_argument("--out", default="research/itu-archive", help="Output directory.")
+    parser.add_argument(
+        "--out",
+        default="research/itu-archive",
+        help="Output directory."
+    )
 
     parser.add_argument(
         "--series",
@@ -2015,88 +2475,109 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Optional comma-separated ITU-T series limit. Defaults to the active "
             "profile's series, or G,H,J,P,T,V with --download-all."
-        ),
+        )
     )
 
     parser.add_argument(
         "--profile",
         choices=("codecs", "all"),
         default="codecs",
-        help="Recommendation profile to download. Default: codecs.",
+        help="Recommendation profile to download. Default: codecs."
     )
 
     parser.add_argument(
         "--allow-list",
         default="",
-        help="Path to a custom Recommendation allow-list, one identifier per line.",
+        help="Path to a custom Recommendation allow-list, one identifier per line."
     )
 
     parser.add_argument(
         "--download-all",
         action="store_true",
-        help="Use the old broad series crawl instead of the codec Recommendation profile.",
+        help="Use the old broad series crawl instead of the codec Recommendation profile."
     )
 
     parser.add_argument(
         "--include-test-signals",
         action="store_true",
-        help="Discover and download ITU-T test-signal vectors.",
+        help="Discover and download ITU-T test-signal vectors."
     )
 
     parser.add_argument(
         "--include-publications",
         action="store_true",
-        help="Discover and download ITU-T Recommendation publications.",
+        help="Discover and download ITU-T Recommendation publications."
     )
 
     parser.add_argument(
         "--test-signal-val-range",
         default="",
-        help="Optional explicit test-signal vector range, for example 1:500.",
+        help="Optional explicit test-signal vector range, for example 1:500."
     )
 
     parser.add_argument(
-        "--delay", type=float, default=1.5, help="Delay between downloads in seconds."
+        "--delay",
+        type=float,
+        default=1.5,
+        help="Delay between downloads in seconds."
     )
 
     parser.add_argument(
         "--timeout-ms",
         type=int,
         default=60_000,
-        help="Playwright page-render timeout in milliseconds.",
+        help="Playwright page-render timeout in milliseconds."
     )
 
     parser.add_argument(
-        "--http-timeout", type=float, default=180.0, help="HTTP timeout in seconds."
+        "--http-timeout",
+        type=float,
+        default=180.0,
+        help="HTTP timeout in seconds."
     )
 
     parser.add_argument(
-        "--user-agent", default="itu-t-archive-downloader/1.0", help="HTTP User-Agent header."
+        "--user-agent",
+        default="itu-t-archive-downloader/1.0",
+        help="HTTP User-Agent header."
     )
 
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Discover pages and links without downloading payloads.",
+        help="Discover pages and links without downloading payloads."
+    )
+
+    parser.add_argument(
+        "--no-extract-archives",
+        action="store_true",
+        help="Keep downloaded archives without extracting supported stdlib archive formats."
     )
 
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Download URLs even when manifest says they were already downloaded.",
+        help="Download URLs even when manifest says they were already downloaded."
     )
 
     parser.add_argument(
-        "--jobs", type=int, default=4, help="Maximum number of concurrent downloads."
+        "--jobs",
+        type=int,
+        default=4,
+        help="Maximum number of concurrent downloads."
     )
 
     parser.add_argument(
         "--all-editions",
         action="store_true",
-        help="Keep all discovered publication and test-signal editions instead of only the latest.",
+        help="Keep all discovered publication and test-signal editions instead of only the latest."
     )
 
-    parser.add_argument("--verbose", action="store_true", help="Print progress.")
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print progress."
+    )
 
     return parser.parse_args()
 
